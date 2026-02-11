@@ -1,0 +1,8 @@
+/venv
+
+/data/test
+/data/train
+
+/models/SegResNet/runs
+/models/UNet/runs
+/models/SwinUNETR/runs
