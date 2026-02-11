@@ -6,3 +6,6 @@
 /models/SegResNet/runs
 /models/UNet/runs
 /models/SwinUNETR/runs
+
+detector
+experiments
