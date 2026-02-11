@@ -1,3 +1,31 @@
+"""
+3D SwinUNETR training script (MONAI + PyTorch).
+
+This module trains a 3D SwinUNETR model for binary segmentation using MONAI's
+data pipeline and evaluation utilities. It supports AMP training, cosine LR
+schedule with warmup, sliding-window inference for validation/test, checkpointing,
+metric logging (Dice/F1), and saving qualitative example overlays and NIfTI
+predictions.
+
+Key notes for SwinUNETR:
+- The ROI / input patch size should be divisible by 32 (e.g., 96) to match the
+  hierarchical patching and windowing constraints.
+- Some MONAI versions expose SwinUNETR parameters like `img_size` and
+  `use_checkpoint`; this script detects them dynamically for compatibility.
+
+Expected input:
+- A CSV manifest with columns: case_id, image_path, mask_path, split
+  where split is one of: train / val / test.
+
+Outputs (per run):
+- config.json
+- manifest_used.csv
+- checkpoints/last.pt, checkpoints/best.pt, checkpoints/best_metric_model.pth
+- plots/loss.png, plots/dice.png, plots/f1.png
+- test_metrics.csv
+- examples/*_overlay.png and *_pred.nii.gz
+"""
+
 # models/SwinUNETR/train_swinunetr3d.py
 import json
 import time
@@ -33,15 +61,52 @@ from monai.networks.nets import SwinUNETR
 # -------------------------- CONFIG -------------------------- #
 @dataclass
 class Config:
+    """Configuration container for SwinUNETR training and evaluation.
+
+    Attributes:
+        manifest_rel: Relative path to the CSV manifest (from project root).
+        seed: Random seed for reproducibility.
+        val_from_train: If the manifest has no 'val' split, sample this fraction
+            from the 'train' split to create validation.
+        roi: 3D patch size used for training crops and sliding-window inference.
+            Must be divisible by 32 for SwinUNETR (96 is OK).
+        batch_size: Training batch size (training uses random crops).
+        num_crop_samples: Number of random crops sampled per volume per iteration.
+            For SwinUNETR, 2 is often enough to reduce VRAM usage.
+        num_workers: DataLoader worker count.
+        cache_rate: MONAI CacheDataset cache rate (0..1).
+        sw_batch_size: Sliding window batch size for eval inference.
+        sw_overlap: Sliding window overlap fraction.
+        eval_use_sliding_window: If True, use sliding-window inference for val/test.
+        pixdim: Target voxel spacing for images.
+        use_orientation_ras: If True, reorient image/label to RAS.
+        feature_size: SwinUNETR feature size (e.g., 24 or 48).
+        use_checkpoint: If supported by MONAI, enables gradient checkpointing.
+        epochs: Number of training epochs.
+        lr: Base learning rate.
+        weight_decay: Weight decay for AdamW.
+        amp: If True and CUDA is available, train with automatic mixed precision.
+        grad_clip: Gradient norm clipping value (<=0 disables).
+        dice_weight: Weight of Dice loss term.
+        ce_weight: Weight of cross-entropy loss term (0 disables CE).
+        pos_class_weight: Positive class weight for cross-entropy (class 1).
+        use_cosine: If True, use cosine annealing LR schedule after warmup.
+        warmup_epochs: Linear warmup epochs for LR (only if use_cosine is True).
+        eval_max_batches: Max number of evaluation batches (large number = no cap).
+        run_name: Optional run name; if empty, timestamp will be used.
+        examples_n: Number of test examples to export as overlays and NIfTI preds.
+        threshold: Reserved for probability thresholding (not used in argmax pipeline).
+    """
+
     # data
     manifest_rel: str = "data/manifest.csv"
     seed: int = 42
-    val_from_train: float = 0.10  # если в manifest нет val
+    val_from_train: float = 0.10  # if the manifest has no 'val'
 
     # roi / loader
-    roi: Tuple[int, int, int] = (96, 96, 96)   # ДОЛЖНО быть кратно 32 для SwinUNETR, 96 ок
+    roi: Tuple[int, int, int] = (96, 96, 96)   # must be divisible by 32 for SwinUNETR
     batch_size: int = 1
-    num_crop_samples: int = 2                 # для SwinUNETR часто достаточно 2 (экономия VRAM)
+    num_crop_samples: int = 2                  # often enough for SwinUNETR (VRAM savings)
     num_workers: int = 2
     cache_rate: float = 0.2
 
@@ -55,8 +120,8 @@ class Config:
     use_orientation_ras: bool = True
 
     # model (SwinUNETR)
-    feature_size: int = 24        # 24/48 (48 тяжелее). Для 16GB рекомендую 24.
-    use_checkpoint: bool = True   # gradient checkpointing (сильно экономит VRAM)
+    feature_size: int = 24        # 24/48 (48 is heavier). For 16GB VRAM, 24 is recommended.
+    use_checkpoint: bool = True   # gradient checkpointing (saves VRAM significantly)
 
     # training
     epochs: int = 5
@@ -85,11 +150,25 @@ class Config:
 
 # -------------------------- PATHS / UTILS -------------------------- #
 def project_root() -> Path:
+    """Return the project root directory.
+
+    The project root is assumed to be two levels above this file:
+    Path(__file__).resolve().parents[2].
+
+    Returns:
+        Absolute Path to the project root.
+    """
     return Path(__file__).resolve().parents[2]
 
 
 def set_seed(seed: int):
+    """Set random seeds for Python, NumPy, and PyTorch.
+
+    Args:
+        seed: Seed value for deterministic-ish behavior.
+    """
     import random
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -97,6 +176,23 @@ def set_seed(seed: int):
 
 
 def ensure_run_dir(model_dir: Path, run_name: str) -> Path:
+    """Create and return a run directory with standard subfolders.
+
+    If run_name is empty, a timestamp-based name is used.
+
+    Structure:
+        runs/<run_name>/
+            checkpoints/
+            plots/
+            examples/
+
+    Args:
+        model_dir: Directory where the training script lives.
+        run_name: Optional run directory name.
+
+    Returns:
+        Path to the created run directory.
+    """
     if not run_name:
         run_name = time.strftime("%Y%m%d_%H%M%S")
     run_dir = model_dir / "runs" / run_name
@@ -107,6 +203,13 @@ def ensure_run_dir(model_dir: Path, run_name: str) -> Path:
 
 
 def gpu_check(run_dir: Path):
+    """Collect and write basic CUDA/GPU information.
+
+    Writes a text file `gpu_info.txt` into run_dir and prints the same info.
+
+    Args:
+        run_dir: Run directory where gpu_info.txt will be stored.
+    """
     lines = []
     lines.append(f"torch.__version__ = {torch.__version__}")
     lines.append(f"cuda available     = {torch.cuda.is_available()}")
@@ -118,7 +221,7 @@ def gpu_check(run_dir: Path):
         lines.append(f"current device     = {idx} ({props.name})")
         lines.append(f"total memory (GB)  = {props.total_memory / (1024**3):.2f}")
     else:
-        lines.append("GPU не обнаружена: обучение будет на CPU (очень медленно).")
+        lines.append("GPU not detected: training will run on CPU (very slow).")
 
     text = "\n".join(lines)
     print("\n=== GPU CHECK ===")
@@ -128,6 +231,12 @@ def gpu_check(run_dir: Path):
 
 
 def save_history_csv(path: Path, rows: List[Dict]):
+    """Save training history as a CSV.
+
+    Args:
+        path: Output CSV path.
+        rows: List of dicts with consistent keys (columns).
+    """
     if not rows:
         return
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -137,12 +246,20 @@ def save_history_csv(path: Path, rows: List[Dict]):
 
 
 def plot_history(history_csv: Path, out_dir: Path):
+    """Plot learning curves (loss, dice, f1) from history.csv.
+
+    Args:
+        history_csv: Path to the history CSV file.
+        out_dir: Directory where plots will be saved as PNG files.
+    """
     df = pd.read_csv(history_csv)
 
     plt.figure()
     plt.plot(df["epoch"], df["train_loss"], label="train_loss")
     plt.plot(df["epoch"], df["val_loss"], label="val_loss")
-    plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "loss.png", dpi=150)
     plt.close()
@@ -150,7 +267,9 @@ def plot_history(history_csv: Path, out_dir: Path):
     plt.figure()
     plt.plot(df["epoch"], df["train_dice"], label="train_dice")
     plt.plot(df["epoch"], df["val_dice"], label="val_dice")
-    plt.xlabel("epoch"); plt.ylabel("dice"); plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("dice")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "dice.png", dpi=150)
     plt.close()
@@ -158,13 +277,26 @@ def plot_history(history_csv: Path, out_dir: Path):
     plt.figure()
     plt.plot(df["epoch"], df["train_f1"], label="train_f1")
     plt.plot(df["epoch"], df["val_f1"], label="val_f1")
-    plt.xlabel("epoch"); plt.ylabel("f1"); plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("f1")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "f1.png", dpi=150)
     plt.close()
 
 
 def resolve_path(p: str) -> str:
+    """Resolve a path string to an absolute path.
+
+    If p is already absolute, it is returned unchanged.
+    Otherwise, it is resolved relative to the project root.
+
+    Args:
+        p: Input path string.
+
+    Returns:
+        Absolute path string.
+    """
     pp = Path(p)
     if pp.is_absolute():
         return str(pp)
@@ -172,15 +304,32 @@ def resolve_path(p: str) -> str:
 
 
 def load_manifest(cfg: Config) -> pd.DataFrame:
+    """Load and validate the dataset manifest.
+
+    The manifest must include columns: case_id, image_path, mask_path.
+    Optional column: split.
+
+    Paths in the manifest are converted to absolute paths.
+
+    Args:
+        cfg: Configuration with manifest_rel.
+
+    Returns:
+        Pandas DataFrame containing the manifest.
+
+    Raises:
+        FileNotFoundError: If the manifest file does not exist.
+        ValueError: If required columns are missing.
+    """
     p = project_root() / cfg.manifest_rel
     if not p.exists():
-        raise FileNotFoundError(f"Не найден manifest: {p}")
+        raise FileNotFoundError(f"Manifest not found: {p}")
 
     df = pd.read_csv(p)
     need = ["case_id", "image_path", "mask_path"]
     for c in need:
         if c not in df.columns:
-            raise ValueError(f"Manifest должен содержать {need}. Сейчас: {df.columns.tolist()}")
+            raise ValueError(f"Manifest must contain {need}. Found: {df.columns.tolist()}")
 
     df["case_id"] = df["case_id"].astype(str).str.strip()
     df["image_path"] = df["image_path"].astype(str).map(resolve_path)
@@ -193,8 +342,23 @@ def load_manifest(cfg: Config) -> pd.DataFrame:
 
 
 def make_splits(cfg: Config, df: pd.DataFrame):
+    """Create train/val/test splits based on the manifest.
+
+    Expects a 'split' column. If there is no 'val' split, a portion of the train
+    rows is sampled and reassigned to 'val'.
+
+    Args:
+        cfg: Configuration with seed and val_from_train.
+        df: Manifest DataFrame with 'split' column.
+
+    Returns:
+        Tuple of (train_df, val_df, test_df).
+
+    Raises:
+        ValueError: If 'split' column is missing.
+    """
     if "split" not in df.columns:
-        raise ValueError("Ожидаю split в data/manifest.csv (ты уже сделал разбиение).")
+        raise ValueError("Expected 'split' column in data/manifest.csv (you said you already split it).")
 
     if "val" not in set(df["split"].unique()):
         tr = df[df["split"] == "train"].copy()
@@ -209,17 +373,51 @@ def make_splits(cfg: Config, df: pd.DataFrame):
 
 
 def make_items(df: pd.DataFrame) -> List[Dict]:
+    """Convert a manifest DataFrame to MONAI-style item dicts.
+
+    Args:
+        df: DataFrame with columns image_path, mask_path, case_id.
+
+    Returns:
+        List of dicts with keys: image, label, case_id.
+    """
     return [{"image": r["image_path"], "label": r["mask_path"], "case_id": r["case_id"]} for _, r in df.iterrows()]
 
 
 def safe_nan_to_num_np(x):
+    """Replace NaN/Inf values with zeros in a NumPy array.
+
+    Args:
+        x: NumPy array.
+
+    Returns:
+        Array with NaN, +Inf, -Inf replaced by 0.0.
+    """
     return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 # -------------------------- TRANSFORMS (fixed resampling) -------------------------- #
 def build_transforms(cfg: Config):
-    """
-    Важное: Spacingd только для image, а label ресемплим через ResampleToMatchd -> одинаковые размеры.
+    """Build MONAI transforms for training and validation/testing.
+
+    Important:
+        - Spacingd is applied only to the image.
+        - The label is resampled to match the image grid via ResampleToMatchd.
+          This guarantees identical spatial shapes and spacing.
+
+    Training pipeline:
+        Base preprocessing +
+        - Random crop by pos/neg labels (fixed ROI)
+        - Light augmentations (rotation/flip/zoom/affine/intensity/noise)
+
+    Validation/testing pipeline:
+        Base preprocessing only (no crops, no augmentation).
+
+    Args:
+        cfg: Configuration.
+
+    Returns:
+        Tuple of (train_transform, val_transform).
     """
     base = [
         transforms.LoadImaged(keys=["image", "label"], ensure_channel_first=True),
@@ -262,7 +460,8 @@ def build_transforms(cfg: Config):
         transforms.RandFlipd(keys=["image", "label"], spatial_axis=2, prob=0.3),
         transforms.RandZoomd(
             keys=["image", "label"],
-            min_zoom=0.9, max_zoom=1.1,
+            min_zoom=0.9,
+            max_zoom=1.1,
             mode=("trilinear", "nearest"),
             align_corners=(True, None),
             prob=0.25,
@@ -289,6 +488,19 @@ def build_transforms(cfg: Config):
 
 # -------------------------- METRICS / VIZ -------------------------- #
 def binary_f1_from_logits(logits_2ch: torch.Tensor, labels_1ch: torch.Tensor, eps=1e-8) -> float:
+    """Compute binary F1 score from 2-channel logits and 1-channel label tensor.
+
+    Prediction is obtained via argmax over channel dimension.
+    Ground truth is treated as positive if label > 0.
+
+    Args:
+        logits_2ch: Tensor of shape [B, 2, ...] (raw logits).
+        labels_1ch: Tensor of shape [B, 1, ...] (original label tensor).
+        eps: Numerical stability constant.
+
+    Returns:
+        Scalar F1 score as float.
+    """
     pred = torch.argmax(logits_2ch, dim=1).float()
     gt = (labels_1ch[:, 0] > 0).float()
     tp = torch.sum(pred * gt)
@@ -299,6 +511,18 @@ def binary_f1_from_logits(logits_2ch: torch.Tensor, labels_1ch: torch.Tensor, ep
 
 
 def three_view_overlay_png(out_png: Path, img3d: np.ndarray, gt3d: np.ndarray, pr3d: np.ndarray, title: str):
+    """Save a 3-panel (sagittal/coronal/axial) overlay visualization as PNG.
+
+    The slice indices are chosen by finding the maximum projected ground-truth mask
+    area along each axis.
+
+    Args:
+        out_png: Output PNG path.
+        img3d: 3D image array [X, Y, Z].
+        gt3d: 3D ground-truth mask array [X, Y, Z].
+        pr3d: 3D predicted mask array [X, Y, Z].
+        title: Figure title prefix.
+    """
     lo, hi = np.percentile(img3d, (1, 99))
     imgv = np.clip(img3d, lo, hi)
 
@@ -337,11 +561,25 @@ def three_view_overlay_png(out_png: Path, img3d: np.ndarray, gt3d: np.ndarray, p
 # -------------------------- MODEL -------------------------- #
 import inspect
 
+
 def build_model(cfg: Config, device: torch.device) -> nn.Module:
-    """
-    Совместимость с разными версиями MONAI:
-    - в некоторых версиях есть параметр img_size
-    - в некоторых его нет (модель сама работает с произвольным размером, если кратен патчу)
+    """Create and move SwinUNETR to the target device (MONAI-version compatible).
+
+    This function supports multiple MONAI versions by inspecting the SwinUNETR
+    constructor signature:
+      - Some versions support `img_size`, others do not.
+      - Some versions support `use_checkpoint`, others do not.
+
+    If `img_size` is available, it is set to cfg.roi. Otherwise, the model is
+    created without it and the script relies on the ROI being compatible with
+    SwinUNETR patch/window constraints.
+
+    Args:
+        cfg: Configuration containing model parameters.
+        device: Target torch device.
+
+    Returns:
+        SwinUNETR model on the given device.
     """
     sig = inspect.signature(SwinUNETR.__init__)
     params = sig.parameters
@@ -352,28 +590,39 @@ def build_model(cfg: Config, device: torch.device) -> nn.Module:
         feature_size=cfg.feature_size,
     )
 
-    # use_checkpoint тоже не во всех версиях
+    # use_checkpoint is not present in all MONAI versions
     if "use_checkpoint" in params:
         kwargs["use_checkpoint"] = cfg.use_checkpoint
 
-    # img_size есть не во всех версиях
+    # img_size is not present in all MONAI versions
     if "img_size" in params:
         kwargs["img_size"] = cfg.roi
 
     model = SwinUNETR(**kwargs).to(device)
 
-    print("Используется SwinUNETR (MONAI).")
+    print("Using SwinUNETR (MONAI).")
     print(f"feature_size={cfg.feature_size} use_checkpoint={getattr(cfg, 'use_checkpoint', None)}")
     if "img_size" in params:
-        print(f"img_size={cfg.roi} (передан в модель)")
+        print(f"img_size={cfg.roi} (passed into model)")
     else:
-        print("img_size НЕ поддерживается этой версией MONAI -> модель создана без img_size")
-        print("Важно: входные размеры на train/val должны быть кратны patch/window (у нас ROI=96 кратно 32).")
+        print("img_size is NOT supported by this MONAI version -> created model without img_size")
+        print("Important: train/val inputs must be compatible with patch/window constraints (ROI=96 is divisible by 32).")
 
     return model
 
 
 def build_scheduler(cfg: Config, optimizer):
+    """Create a cosine annealing learning rate scheduler (optional).
+
+    Warmup is handled externally in the training loop by directly setting LR.
+
+    Args:
+        cfg: Configuration with scheduler settings.
+        optimizer: Torch optimizer.
+
+    Returns:
+        CosineAnnealingLR scheduler or None if disabled.
+    """
     if not cfg.use_cosine:
         return None
     t_max = max(1, cfg.epochs - cfg.warmup_epochs)
@@ -381,19 +630,44 @@ def build_scheduler(cfg: Config, optimizer):
 
 
 def current_lr(optimizer):
+    """Get the current learning rate from the optimizer.
+
+    Args:
+        optimizer: Torch optimizer.
+
+    Returns:
+        Current LR (float).
+    """
     return optimizer.param_groups[0]["lr"]
 
 
 def set_lr(optimizer, lr):
+    """Set learning rate for all parameter groups.
+
+    Args:
+        optimizer: Torch optimizer.
+        lr: New learning rate value.
+    """
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
 
 def forward_for_eval(cfg: Config, model: nn.Module, x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Forward pass for validation/test, optionally using sliding-window inference.
+
+    Args:
+        cfg: Configuration with eval sliding-window settings.
+        model: Segmentation model.
+        x: Input tensor [B, C, X, Y, Z].
+        device: Torch device for inference.
+
+    Returns:
+        Logits tensor [B, 2, X, Y, Z] (stitched if sliding window is used).
+    """
     if not cfg.eval_use_sliding_window:
         return model(x)
 
-    # Важно: roi_size == cfg.roi == img_size модели
+    # Important: roi_size == cfg.roi (and equals img_size if the model supports it)
     return sliding_window_inference(
         inputs=x,
         roi_size=cfg.roi,
@@ -408,7 +682,43 @@ def forward_for_eval(cfg: Config, model: nn.Module, x: torch.Tensor, device: tor
 
 
 # -------------------------- TRAIN / EVAL -------------------------- #
-def train_one_epoch(model, loader, optimizer, dice_loss, ce_loss, cfg, device, scaler, post_pred, post_label, dice_metric):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    dice_loss,
+    ce_loss,
+    cfg,
+    device,
+    scaler,
+    post_pred,
+    post_label,
+    dice_metric,
+):
+    """Run one training epoch.
+
+    Training is performed on ROI-sized random crops.
+
+    Metrics:
+        - Dice: computed using MONAI DiceMetric on one-hot predictions/labels.
+        - F1: computed on argmax predictions vs binary ground truth.
+
+    Args:
+        model: Segmentation model.
+        loader: Training DataLoader.
+        optimizer: Optimizer instance.
+        dice_loss: MONAI DiceLoss instance.
+        ce_loss: CrossEntropyLoss instance.
+        cfg: Configuration.
+        device: Torch device.
+        scaler: GradScaler for AMP (can be disabled).
+        post_pred: Post-processing transform for predictions (discretization).
+        post_label: Post-processing transform for labels (one-hot).
+        dice_metric: MONAI DiceMetric instance.
+
+    Returns:
+        Tuple: (epoch_loss, mean_dice, mean_f1)
+    """
     model.train()
     epoch_loss = 0.0
     n_steps = 0
@@ -424,13 +734,13 @@ def train_one_epoch(model, loader, optimizer, dice_loss, ce_loss, cfg, device, s
 
         use_amp = cfg.amp and torch.cuda.is_available()
         with autocast(device_type="cuda", enabled=use_amp):
-            logits = model(x)  # train на fixed ROI
+            logits = model(x)  # training on fixed ROI
             loss = cfg.dice_weight * dice_loss(logits, y_bin)
             if cfg.ce_weight > 0:
                 loss = loss + cfg.ce_weight * ce_loss(logits, y_bin[:, 0])
 
         if not torch.isfinite(loss):
-            print("[WARN] non-finite loss -> skip batch")
+            print("[WARN] Non-finite loss -> skipping batch")
             continue
 
         if use_amp:
@@ -466,6 +776,24 @@ def train_one_epoch(model, loader, optimizer, dice_loss, ce_loss, cfg, device, s
 
 @torch.no_grad()
 def evaluate(model, loader, dice_loss, ce_loss, cfg, device, post_pred, post_label, dice_metric):
+    """Evaluate the model on a validation/test DataLoader.
+
+    Uses sliding-window inference if cfg.eval_use_sliding_window is enabled.
+
+    Args:
+        model: Segmentation model.
+        loader: Validation/Test DataLoader.
+        dice_loss: MONAI DiceLoss instance.
+        ce_loss: CrossEntropyLoss instance.
+        cfg: Configuration.
+        device: Torch device.
+        post_pred: Post-processing transform for predictions (discretization).
+        post_label: Post-processing transform for labels (one-hot).
+        dice_metric: MONAI DiceMetric instance.
+
+    Returns:
+        Tuple: (mean_loss, dice, mean_f1)
+    """
     model.eval()
     val_losses = []
     val_f1_vals = []
@@ -503,6 +831,21 @@ def evaluate(model, loader, dice_loss, ce_loss, cfg, device, post_pred, post_lab
 
 @torch.no_grad()
 def save_examples(model, df_test: pd.DataFrame, run_dir: Path, cfg: Config, device):
+    """Save qualitative prediction examples on the test set.
+
+    For a small subset of test cases:
+        - Run preprocessing (val transforms)
+        - Run inference (sliding-window if enabled)
+        - Save 3-view PNG overlays (image + GT contour + prediction contour)
+        - Save predicted segmentation as NIfTI (.nii.gz) using the GT affine
+
+    Args:
+        model: Trained segmentation model.
+        df_test: Test split DataFrame.
+        run_dir: Run directory (examples will be saved to run_dir/examples).
+        cfg: Configuration with examples_n.
+        device: Torch device.
+    """
     model.eval()
     _, val_tf = build_transforms(cfg)
     ex_dir = run_dir / "examples"
@@ -540,10 +883,24 @@ def save_examples(model, df_test: pd.DataFrame, run_dir: Path, cfg: Config, devi
 
 
 def main():
+    """Entry point for training, evaluation, and artifact export.
+
+    Workflow:
+        1. Create config and set seeds
+        2. Enable CUDA performance flags (TF32 if available)
+        3. Create run directory and write config
+        4. Load manifest and create splits
+        5. Build transforms, datasets, loaders
+        6. Build model, losses, optimizer, scheduler
+        7. Train for cfg.epochs with warmup + cosine schedule
+        8. Save checkpoints and plots each epoch
+        9. Evaluate on test split and save metrics
+        10. Save qualitative examples and NIfTI predictions
+    """
     cfg = Config()
     set_seed(cfg.seed)
 
-    # ускорение на GPU
+    # Speed-up on GPU
     torch.backends.cudnn.benchmark = True
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -560,11 +917,13 @@ def main():
     train_df, val_df, test_df = make_splits(cfg, df)
 
     print(f"Train={len(train_df)}  Val={len(val_df)}  Test={len(test_df)}")
-    pd.concat([
-        train_df.assign(split="train"),
-        val_df.assign(split="val"),
-        test_df.assign(split="test"),
-    ]).to_csv(run_dir / "manifest_used.csv", index=False)
+    pd.concat(
+        [
+            train_df.assign(split="train"),
+            val_df.assign(split="val"),
+            test_df.assign(split="test"),
+        ]
+    ).to_csv(run_dir / "manifest_used.csv", index=False)
 
     train_items = make_items(train_df)
     val_items = make_items(val_df)
@@ -577,18 +936,27 @@ def main():
     test_ds = CacheDataset(test_items, transform=val_tf, cache_rate=cfg.cache_rate, num_workers=0)
 
     train_loader = data.DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, collate_fn=list_data_collate,
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = data.DataLoader(
-        val_ds, batch_size=1, shuffle=False,
-        num_workers=max(0, cfg.num_workers // 2), collate_fn=list_data_collate,
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=max(0, cfg.num_workers // 2),
+        collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
     )
     test_loader = data.DataLoader(
-        test_ds, batch_size=1, shuffle=False,
-        num_workers=max(0, cfg.num_workers // 2), collate_fn=list_data_collate,
+        test_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=max(0, cfg.num_workers // 2),
+        collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -610,7 +978,7 @@ def main():
     best_dice = -1.0
 
     for epoch in range(1, cfg.epochs + 1):
-        # warmup
+        # Linear warmup for LR (only when cosine schedule is enabled)
         if cfg.use_cosine and epoch <= cfg.warmup_epochs:
             lr = cfg.lr * (epoch / max(1, cfg.warmup_epochs))
             set_lr(optimizer, lr)
@@ -618,13 +986,21 @@ def main():
         t0 = time.time()
 
         tr_loss, tr_dice, tr_f1 = train_one_epoch(
-            model, train_loader, optimizer, dice_loss, ce_loss, cfg, device, scaler,
-            post_pred, post_label, dice_metric
+            model,
+            train_loader,
+            optimizer,
+            dice_loss,
+            ce_loss,
+            cfg,
+            device,
+            scaler,
+            post_pred,
+            post_label,
+            dice_metric,
         )
 
         val_loss, val_dice, val_f1 = evaluate(
-            model, val_loader, dice_loss, ce_loss, cfg, device,
-            post_pred, post_label, dice_metric
+            model, val_loader, dice_loss, ce_loss, cfg, device, post_pred, post_label, dice_metric
         )
 
         if cosine is not None and epoch > cfg.warmup_epochs:
@@ -672,8 +1048,7 @@ def main():
 
     print("\n=== TEST ===")
     test_loss, test_dice, test_f1 = evaluate(
-        model, test_loader, dice_loss, ce_loss, cfg, device,
-        post_pred, post_label, dice_metric
+        model, test_loader, dice_loss, ce_loss, cfg, device, post_pred, post_label, dice_metric
     )
     print(f"TEST loss={test_loss:.4f} dice={test_dice:.4f} f1={test_f1:.4f}")
     pd.DataFrame([{"test_loss": test_loss, "test_dice": test_dice, "test_f1": test_f1}]).to_csv(

@@ -2,23 +2,24 @@ from pathlib import Path
 import numpy as np
 import nibabel as nib
 
-# --- настройки ---
-MANIFEST = Path("data/manifest.csv")   # или prepared_manifest.csv
-CASE_ID = "100"                          # <- поменяй на нужный
-OUT_DIR = Path("exports")              # куда сохранять
-EXPORT_MESH = True                     # False если нужен только NIfTI
-KEEP_LARGEST_COMPONENT = True          # убрать мелкий шум
-# -----------------
+# --- settings ---
+MANIFEST = Path("data/manifest.csv")   # or prepared_manifest.csv
+CASE_ID = "100"                        # <- set the needed case id
+OUT_DIR = Path("exports")              # output folder
+EXPORT_MESH = True                     # set False to export only NIfTI
+KEEP_LARGEST_COMPONENT = True          # remove small noisy components
+# ----------------
+
 
 def keep_largest_cc(mask: np.ndarray) -> np.ndarray:
-    """Оставляет только крупнейшую связную компоненту (3D)."""
+    """Keep only the largest 3D connected component (6-connectivity)."""
     from collections import deque
 
     mask = (mask > 0).astype(np.uint8)
     visited = np.zeros(mask.shape, dtype=np.uint8)
 
-    # 6-связность
-    neigh = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+    # 6-neighborhood connectivity
+    neigh = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
 
     best_count = 0
     best_voxels = None
@@ -49,7 +50,9 @@ def keep_largest_cc(mask: np.ndarray) -> np.ndarray:
         out[np.array(xs), np.array(ys), np.array(zs)] = 1
     return out
 
+
 def main():
+    """Export a case mask as NIfTI and (optionally) a PLY mesh."""
     import pandas as pd
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -64,7 +67,7 @@ def main():
     print("IMG :", img_path)
     print("MSK :", msk_path)
 
-    # читаем маску и сохраняем affine/spacing из исходного NIfTI
+    # Load mask and preserve affine/header from the original NIfTI
     msk_nii = nib.load(str(msk_path))
     msk = msk_nii.get_fdata(dtype=np.float32)
 
@@ -74,7 +77,7 @@ def main():
         print("Keeping largest connected component...")
         mask_bin = keep_largest_cc(mask_bin)
 
-    # 1) сохраняем mask-only volume
+    # 1) Save mask-only volume
     out_mask_path = OUT_DIR / f"{CASE_ID}_mask_only.nii.gz"
     out_nii = nib.Nifti1Image(mask_bin, affine=msk_nii.affine, header=msk_nii.header)
     out_nii.set_data_dtype(np.uint8)
@@ -84,18 +87,18 @@ def main():
     if not EXPORT_MESH:
         return
 
-    # 2) экспорт mesh через marching cubes
+    # 2) Export mesh via marching cubes
     print("Exporting mesh (marching cubes)...")
     try:
         from skimage import measure
     except ImportError:
-        raise SystemExit("Нужно поставить scikit-image: pip install scikit-image")
+        raise SystemExit("Please install scikit-image: pip install scikit-image")
 
-    # spacing берём из header (pixdim)
+    # Use voxel spacing from header (pixdim)
     zooms = msk_nii.header.get_zooms()[:3]  # (sx, sy, sz)
     verts, faces, _, _ = measure.marching_cubes(mask_bin, level=0.5, spacing=zooms)
 
-    # сохраним в PLY (простой ASCII)
+    # Save as ASCII PLY
     out_ply = OUT_DIR / f"{CASE_ID}_artery_tree.ply"
     with open(out_ply, "w", encoding="utf-8") as f:
         f.write("ply\nformat ascii 1.0\n")
@@ -110,9 +113,10 @@ def main():
             f.write(f"3 {tri[0]} {tri[1]} {tri[2]}\n")
 
     print("Saved mesh PLY:", out_ply.resolve())
-    print("\nОткрытие:")
+    print("\nOpen with:")
     print("- mask-only NIfTI: 3D Slicer / napari (Volume Rendering)")
     print("- mesh PLY: MeshLab / Blender / 3D Slicer")
+
 
 if __name__ == "__main__":
     main()

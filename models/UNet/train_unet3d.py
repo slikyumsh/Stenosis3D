@@ -1,3 +1,32 @@
+"""
+3D UNet / BasicUNet training script (MONAI + PyTorch), "Kaggle-like" setup.
+
+This module trains a 3D UNet-style model (either MONAI BasicUNet or UNet) for
+binary segmentation using MONAI transforms and metrics. It supports optional
+train/val/test splitting when the manifest lacks a `split` column, caching via
+CacheDataset, metric logging (Dice/F1), checkpointing, and saving qualitative
+example overlays plus NIfTI predictions.
+
+Key preprocessing fix:
+- Apply Spacingd ONLY to the image.
+- Resample the label to match the image grid via ResampleToMatchd.
+This prevents shape mismatches that can break RandCropByPosNegLabeld.
+
+Expected input:
+- A CSV manifest with columns: case_id, image_path, mask_path.
+- Optional column: split (train/val/test). If missing, the script will:
+    1) create train/test via train_test_split,
+    2) sample val from train.
+
+Outputs (per run):
+- config.json
+- manifest_used.csv
+- checkpoints/last.pt, checkpoints/best.pt, checkpoints/best_metric_model.pth
+- plots/loss.png, plots/dice.png, plots/f1.png
+- test_metrics.csv
+- examples/*_overlay.png and *_pred.nii.gz
+"""
+
 # models/UNet/train_unet3d_like_kaggle.py
 import json
 import time
@@ -34,10 +63,38 @@ from monai.data import decollate_batch
 # -------------------------- CONFIG -------------------------- #
 @dataclass
 class Config:
+    """Configuration container for UNet/BasicUNet training and evaluation.
+
+    Attributes:
+        manifest_rel: Relative path to the CSV manifest (from project root).
+        seed: Random seed for reproducibility.
+        test_size: If the manifest has no 'split' column, fraction used for the test split.
+        val_from_train: Fraction of train used to create the validation split (if no 'val').
+        roi: 3D patch size used for training crops.
+        batch_size: Training batch size (training uses random crops).
+        num_crop_samples: Number of random crops sampled per volume per iteration.
+        num_workers: DataLoader worker count.
+        cache_rate: MONAI CacheDataset cache rate (0..1).
+        pixdim: Target voxel spacing for images.
+        use_orientation_ras: If True, reorient image/label to RAS.
+        epochs: Number of training epochs.
+        lr: Learning rate for Adam.
+        use_basic_unet: If True, train MONAI BasicUNet; otherwise use MONAI UNet.
+        amp: If True and CUDA is available, train with automatic mixed precision.
+        grad_clip: Gradient norm clipping value (<=0 disables).
+        dice_weight: Weight of Dice loss term.
+        ce_weight: Weight of cross-entropy loss term (0 disables CE).
+        pos_class_weight: Positive class weight for cross-entropy (class 1).
+        eval_max_batches: Max number of evaluation batches (large number = no cap).
+        run_name: Optional run name; if empty, timestamp will be used.
+        examples_n: Number of test examples to export as overlays and NIfTI preds.
+        threshold: Reserved for probability thresholding (not used in argmax pipeline).
+    """
+
     manifest_rel: str = "data/manifest.csv"
     seed: int = 42
 
-    # если split нет
+    # if split is missing
     test_size: float = 0.20
     val_from_train: float = 0.10
 
@@ -56,12 +113,12 @@ class Config:
     epochs: int = 3
     lr: float = 1e-4
     use_basic_unet: bool = True
-    amp: bool = False          # как в ноутбуке
+    amp: bool = False          # matches the original notebook setting
     grad_clip: float = 1.0
 
     # loss
     dice_weight: float = 1.0
-    ce_weight: float = 0.0     # можно поставить 0.5 для стабильности
+    ce_weight: float = 0.0     # set to 0.5 for extra stability if desired
     pos_class_weight: float = 5.0
 
     # eval speed
@@ -75,11 +132,25 @@ class Config:
 
 # -------------------------- PATHS / UTILS -------------------------- #
 def project_root() -> Path:
+    """Return the project root directory.
+
+    The project root is assumed to be two levels above this file:
+    Path(__file__).resolve().parents[2].
+
+    Returns:
+        Absolute Path to the project root.
+    """
     return Path(__file__).resolve().parents[2]
 
 
 def set_seed(seed: int):
+    """Set random seeds for Python, NumPy, and PyTorch.
+
+    Args:
+        seed: Seed value for deterministic-ish behavior.
+    """
     import random
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -87,6 +158,23 @@ def set_seed(seed: int):
 
 
 def ensure_run_dir(unet_dir: Path, run_name: str) -> Path:
+    """Create and return a run directory with standard subfolders.
+
+    If run_name is empty, a timestamp-based name is used.
+
+    Structure:
+        runs/<run_name>/
+            checkpoints/
+            plots/
+            examples/
+
+    Args:
+        unet_dir: Directory where the training script lives.
+        run_name: Optional run directory name.
+
+    Returns:
+        Path to the created run directory.
+    """
     if not run_name:
         run_name = time.strftime("%Y%m%d_%H%M%S")
     run_dir = unet_dir / "runs" / run_name
@@ -97,6 +185,13 @@ def ensure_run_dir(unet_dir: Path, run_name: str) -> Path:
 
 
 def gpu_check(run_dir: Path):
+    """Collect and write basic CUDA/GPU information.
+
+    Writes a text file `gpu_info.txt` into run_dir and prints the same info.
+
+    Args:
+        run_dir: Run directory where gpu_info.txt will be stored.
+    """
     lines = []
     lines.append(f"torch.__version__ = {torch.__version__}")
     lines.append(f"cuda available     = {torch.cuda.is_available()}")
@@ -108,7 +203,7 @@ def gpu_check(run_dir: Path):
         lines.append(f"current device     = {idx} ({props.name})")
         lines.append(f"total memory (GB)  = {props.total_memory / (1024**3):.2f}")
     else:
-        lines.append("GPU не обнаружена: обучение будет на CPU (очень медленно).")
+        lines.append("GPU not detected: training will run on CPU (very slow).")
 
     text = "\n".join(lines)
     print("\n=== GPU CHECK ===")
@@ -118,6 +213,12 @@ def gpu_check(run_dir: Path):
 
 
 def save_history_csv(path: Path, rows: List[Dict]):
+    """Save training history as a CSV.
+
+    Args:
+        path: Output CSV path.
+        rows: List of dicts with consistent keys (columns).
+    """
     if not rows:
         return
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -127,12 +228,20 @@ def save_history_csv(path: Path, rows: List[Dict]):
 
 
 def plot_history(history_csv: Path, out_dir: Path):
+    """Plot learning curves (loss, dice, f1) from history.csv.
+
+    Args:
+        history_csv: Path to the history CSV file.
+        out_dir: Directory where plots will be saved as PNG files.
+    """
     df = pd.read_csv(history_csv)
 
     plt.figure()
     plt.plot(df["epoch"], df["train_loss"], label="train_loss")
     plt.plot(df["epoch"], df["val_loss"], label="val_loss")
-    plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "loss.png", dpi=150)
     plt.close()
@@ -140,7 +249,9 @@ def plot_history(history_csv: Path, out_dir: Path):
     plt.figure()
     plt.plot(df["epoch"], df["train_dice"], label="train_dice")
     plt.plot(df["epoch"], df["val_dice"], label="val_dice")
-    plt.xlabel("epoch"); plt.ylabel("dice"); plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("dice")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "dice.png", dpi=150)
     plt.close()
@@ -148,13 +259,26 @@ def plot_history(history_csv: Path, out_dir: Path):
     plt.figure()
     plt.plot(df["epoch"], df["train_f1"], label="train_f1")
     plt.plot(df["epoch"], df["val_f1"], label="val_f1")
-    plt.xlabel("epoch"); plt.ylabel("f1"); plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("f1")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_dir / "f1.png", dpi=150)
     plt.close()
 
 
 def resolve_path(p: str) -> str:
+    """Resolve a path string to an absolute path.
+
+    If p is already absolute, it is returned unchanged.
+    Otherwise, it is resolved relative to the project root.
+
+    Args:
+        p: Input path string.
+
+    Returns:
+        Absolute path string.
+    """
     pp = Path(p)
     if pp.is_absolute():
         return str(pp)
@@ -162,15 +286,32 @@ def resolve_path(p: str) -> str:
 
 
 def load_manifest(cfg: Config) -> pd.DataFrame:
+    """Load and validate the dataset manifest.
+
+    The manifest must include columns: case_id, image_path, mask_path.
+    Optional column: split.
+
+    Paths in the manifest are converted to absolute paths.
+
+    Args:
+        cfg: Configuration with manifest_rel.
+
+    Returns:
+        Pandas DataFrame containing the manifest.
+
+    Raises:
+        FileNotFoundError: If the manifest file does not exist.
+        ValueError: If required columns are missing.
+    """
     p = project_root() / cfg.manifest_rel
     if not p.exists():
-        raise FileNotFoundError(f"Не найден manifest: {p}")
+        raise FileNotFoundError(f"Manifest not found: {p}")
 
     df = pd.read_csv(p)
     need = ["case_id", "image_path", "mask_path"]
     for c in need:
         if c not in df.columns:
-            raise ValueError(f"Manifest должен содержать {need}. Сейчас: {df.columns.tolist()}")
+            raise ValueError(f"Manifest must contain {need}. Found: {df.columns.tolist()}")
 
     df["case_id"] = df["case_id"].astype(str).str.strip()
     df["image_path"] = df["image_path"].astype(str).map(resolve_path)
@@ -183,6 +324,20 @@ def load_manifest(cfg: Config) -> pd.DataFrame:
 
 
 def make_splits(cfg: Config, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Create train/val/test splits from the manifest.
+
+    If 'split' is missing:
+        - Create train/test using sklearn train_test_split on case_id.
+    If 'val' is missing:
+        - Sample val_from_train fraction from train and assign to 'val'.
+
+    Args:
+        cfg: Configuration with split parameters.
+        df: Manifest DataFrame.
+
+    Returns:
+        Tuple of (train_df, val_df, test_df).
+    """
     if "split" not in df.columns:
         ids = df["case_id"].tolist()
         tr_ids, te_ids = train_test_split(ids, test_size=cfg.test_size, random_state=cfg.seed, shuffle=True)
@@ -202,20 +357,51 @@ def make_splits(cfg: Config, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFra
 
 
 def make_items(df: pd.DataFrame) -> List[Dict]:
+    """Convert a manifest DataFrame to MONAI-style item dicts.
+
+    Args:
+        df: DataFrame with columns image_path, mask_path, case_id.
+
+    Returns:
+        List of dicts with keys: image, label, case_id.
+    """
     return [{"image": r["image_path"], "label": r["mask_path"], "case_id": r["case_id"]} for _, r in df.iterrows()]
 
 
 def safe_nan_to_num_np(x):
+    """Replace NaN/Inf values with zeros in a NumPy array.
+
+    Args:
+        x: NumPy array.
+
+    Returns:
+        Array with NaN, +Inf, -Inf replaced by 0.0.
+    """
     return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 # -------------------------- TRANSFORMS (FIXED) -------------------------- #
 def build_transforms(cfg: Config):
-    """
-    Ключевой фикс:
-    - Spacingd применяем ТОЛЬКО к image
-    - label ресемплим строго под image через ResampleToMatchd
-    Это устраняет рассинхрон размеров, из-за которого падал RandCropByPosNegLabeld.
+    """Build MONAI transforms for training and validation/testing.
+
+    Key fix:
+        - Apply Spacingd ONLY to the image.
+        - Resample the label to match the image grid via ResampleToMatchd.
+        This removes shape desynchronization that can break RandCropByPosNegLabeld.
+
+    Training pipeline:
+        Base preprocessing +
+        - Random crop by pos/neg labels (ROI)
+        - Augmentations (rotation/flip/zoom/affine/intensity/noise)
+
+    Validation/testing pipeline:
+        Base preprocessing only (no crops, no augmentation).
+
+    Args:
+        cfg: Configuration.
+
+    Returns:
+        Tuple of (train_transform, val_transform).
     """
     base = [
         transforms.LoadImaged(keys=["image", "label"], ensure_channel_first=True),
@@ -265,7 +451,6 @@ def build_transforms(cfg: Config):
         transforms.RandFlipd(keys=["image", "label"], spatial_axis=0, prob=0.3),
         transforms.RandFlipd(keys=["image", "label"], spatial_axis=1, prob=0.3),
         transforms.RandFlipd(keys=["image", "label"], spatial_axis=2, prob=0.3),
-
         transforms.RandZoomd(
             keys=["image", "label"],
             min_zoom=0.9,
@@ -283,7 +468,6 @@ def build_transforms(cfg: Config):
             mode=("bilinear", "nearest"),
             padding_mode="border",
         ),
-
         transforms.RandAdjustContrastd(keys=["image"], gamma=(0.7, 1.5), prob=0.3),
         transforms.RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.3),
         transforms.RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.3),
@@ -297,8 +481,21 @@ def build_transforms(cfg: Config):
 
 # -------------------------- METRICS -------------------------- #
 def binary_f1_from_logits(logits_2ch: torch.Tensor, labels_1ch: torch.Tensor, eps=1e-8) -> float:
-    pred = torch.argmax(logits_2ch, dim=1).float()          # [B,D,H,W]
-    gt = (labels_1ch[:, 0] > 0).float()                     # [B,D,H,W]
+    """Compute binary F1 score from 2-channel logits and 1-channel label tensor.
+
+    Prediction is obtained via argmax over channel dimension.
+    Ground truth is treated as positive if label > 0.
+
+    Args:
+        logits_2ch: Tensor of shape [B, 2, ...] (raw logits).
+        labels_1ch: Tensor of shape [B, 1, ...] (original label tensor).
+        eps: Numerical stability constant.
+
+    Returns:
+        Scalar F1 score as float.
+    """
+    pred = torch.argmax(logits_2ch, dim=1).float()   # [B, D, H, W]
+    gt = (labels_1ch[:, 0] > 0).float()              # [B, D, H, W]
 
     tp = torch.sum(pred * gt)
     fp = torch.sum(pred * (1 - gt))
@@ -308,6 +505,18 @@ def binary_f1_from_logits(logits_2ch: torch.Tensor, labels_1ch: torch.Tensor, ep
 
 
 def three_view_overlay_png(out_png: Path, img3d: np.ndarray, gt3d: np.ndarray, pr3d: np.ndarray, title: str):
+    """Save a 3-panel (sagittal/coronal/axial) overlay visualization as PNG.
+
+    The slice indices are chosen by finding the maximum projected ground-truth mask
+    area along each axis.
+
+    Args:
+        out_png: Output PNG path.
+        img3d: 3D image array [X, Y, Z].
+        gt3d: 3D ground-truth mask array [X, Y, Z].
+        pr3d: 3D predicted mask array [X, Y, Z].
+        title: Figure title prefix.
+    """
     lo, hi = np.percentile(img3d, (1, 99))
     imgv = np.clip(img3d, lo, hi)
 
@@ -346,6 +555,19 @@ def three_view_overlay_png(out_png: Path, img3d: np.ndarray, gt3d: np.ndarray, p
 
 # -------------------------- MODEL -------------------------- #
 def build_model(cfg: Config, device: torch.device) -> nn.Module:
+    """Create and move a 3D UNet-style model to the target device.
+
+    Model selection:
+        - If cfg.use_basic_unet is True: use MONAI BasicUNet (3D).
+        - Otherwise: use MONAI UNet with architecture depending on ROI size.
+
+    Args:
+        cfg: Configuration.
+        device: Target torch device.
+
+    Returns:
+        The created model on the given device.
+    """
     if cfg.use_basic_unet:
         model = BasicUNet(
             spatial_dims=3,
@@ -354,7 +576,7 @@ def build_model(cfg: Config, device: torch.device) -> nn.Module:
             features=(32, 64, 128, 256, 512, 32),
             dropout=0.1,
         ).to(device)
-        print("Используется BasicUNet (как в ноутбуке).")
+        print("Using BasicUNet (as in the notebook).")
         return model
 
     if cfg.roi[0] == 64:
@@ -369,7 +591,7 @@ def build_model(cfg: Config, device: torch.device) -> nn.Module:
             up_kernel_size=3,
             norm="batch",
         ).to(device)
-        print("Используется UNet для ROI=64 (как в ноутбуке).")
+        print("Using UNet for ROI=64 (as in the notebook).")
         return model
 
     model = UNet(
@@ -383,12 +605,48 @@ def build_model(cfg: Config, device: torch.device) -> nn.Module:
         up_kernel_size=3,
         norm="batch",
     ).to(device)
-    print("Используется UNet (как в ноутбуке).")
+    print("Using UNet (as in the notebook).")
     return model
 
 
 # -------------------------- TRAIN / EVAL -------------------------- #
-def train_one_epoch(model, loader, optimizer, dice_loss, ce_loss, cfg, device, scaler, post_pred, post_label, dice_metric):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    dice_loss,
+    ce_loss,
+    cfg,
+    device,
+    scaler,
+    post_pred,
+    post_label,
+    dice_metric,
+):
+    """Run one training epoch.
+
+    Training is performed on ROI-sized random crops.
+
+    Metrics:
+        - Dice: computed using MONAI DiceMetric on one-hot predictions/labels.
+        - F1: computed on argmax predictions vs binary ground truth.
+
+    Args:
+        model: Segmentation model.
+        loader: Training DataLoader.
+        optimizer: Optimizer instance.
+        dice_loss: MONAI DiceLoss instance.
+        ce_loss: CrossEntropyLoss instance.
+        cfg: Configuration.
+        device: Torch device.
+        scaler: GradScaler for AMP (can be disabled).
+        post_pred: Post-processing transform for predictions (discretization).
+        post_label: Post-processing transform for labels (one-hot).
+        dice_metric: MONAI DiceMetric instance.
+
+    Returns:
+        Tuple: (epoch_loss, mean_dice, mean_f1)
+    """
     model.train()
     epoch_loss = 0.0
     n_steps = 0
@@ -397,8 +655,8 @@ def train_one_epoch(model, loader, optimizer, dice_loss, ce_loss, cfg, device, s
     train_f1_vals = []
 
     for batch in tqdm(loader, desc="train", leave=False):
-        x = batch["image"].to(device)   # [B,1,D,H,W]
-        y = batch["label"].to(device)   # [B,1,D,H,W]
+        x = batch["image"].to(device)   # [B, 1, D, H, W]
+        y = batch["label"].to(device)   # [B, 1, D, H, W]
 
         y_bin = (y > 0).long()
 
@@ -406,13 +664,13 @@ def train_one_epoch(model, loader, optimizer, dice_loss, ce_loss, cfg, device, s
 
         use_amp = cfg.amp and torch.cuda.is_available()
         with autocast(device_type="cuda", enabled=use_amp):
-            logits = model(x)  # [B,2,D,H,W]
+            logits = model(x)  # [B, 2, D, H, W]
             loss = cfg.dice_weight * dice_loss(logits, y_bin)
             if cfg.ce_weight > 0:
                 loss = loss + cfg.ce_weight * ce_loss(logits, y_bin[:, 0])
 
         if not torch.isfinite(loss):
-            print("[WARN] non-finite loss -> skip batch")
+            print("[WARN] Non-finite loss -> skipping batch")
             continue
 
         if use_amp:
@@ -450,6 +708,27 @@ def train_one_epoch(model, loader, optimizer, dice_loss, ce_loss, cfg, device, s
 
 @torch.no_grad()
 def evaluate(model, loader, dice_loss, ce_loss, cfg, device, post_pred, post_label, dice_metric):
+    """Evaluate the model on a validation/test DataLoader.
+
+    Note:
+        This script uses full-volume inference (no sliding window). If you hit
+        memory issues, consider adding sliding_window_inference similar to the
+        SegResNet/SwinUNETR scripts.
+
+    Args:
+        model: Segmentation model.
+        loader: Validation/Test DataLoader.
+        dice_loss: MONAI DiceLoss instance.
+        ce_loss: CrossEntropyLoss instance.
+        cfg: Configuration.
+        device: Torch device.
+        post_pred: Post-processing transform for predictions (discretization).
+        post_label: Post-processing transform for labels (one-hot).
+        dice_metric: MONAI DiceMetric instance.
+
+    Returns:
+        Tuple: (mean_loss, dice, mean_f1)
+    """
     model.eval()
     val_losses = []
     val_f1_vals = []
@@ -487,6 +766,21 @@ def evaluate(model, loader, dice_loss, ce_loss, cfg, device, post_pred, post_lab
 
 @torch.no_grad()
 def save_examples(model, df_test: pd.DataFrame, run_dir: Path, cfg: Config, device):
+    """Save qualitative prediction examples on the test set.
+
+    For a small subset of test cases:
+        - Run preprocessing (val transforms)
+        - Run inference
+        - Save 3-view PNG overlays (image + GT contour + prediction contour)
+        - Save predicted segmentation as NIfTI (.nii.gz) using the GT affine
+
+    Args:
+        model: Trained segmentation model.
+        df_test: Test split DataFrame.
+        run_dir: Run directory (examples will be saved to run_dir/examples).
+        cfg: Configuration with examples_n.
+        device: Torch device.
+    """
     model.eval()
     _, val_tf = build_transforms(cfg)
 
@@ -501,11 +795,11 @@ def save_examples(model, df_test: pd.DataFrame, run_dir: Path, cfg: Config, devi
         msk_path = str(pick.loc[i, "mask_path"])
 
         sample = val_tf({"image": img_path, "label": msk_path})
-        x = sample["image"].unsqueeze(0).to(device)   # [1,1,D,H,W]
-        y = sample["label"].unsqueeze(0).to(device)   # [1,1,D,H,W]
+        x = sample["image"].unsqueeze(0).to(device)   # [1, 1, D, H, W]
+        y = sample["label"].unsqueeze(0).to(device)   # [1, 1, D, H, W]
 
         logits = model(x)
-        pred = torch.argmax(logits, dim=1)[0].cpu().numpy().astype(np.uint8)  # [D,H,W]
+        pred = torch.argmax(logits, dim=1)[0].cpu().numpy().astype(np.uint8)  # [D, H, W]
         gt = (y[0, 0].cpu().numpy() > 0).astype(np.uint8)
         img = x[0, 0].cpu().numpy()
 
@@ -522,6 +816,18 @@ def save_examples(model, df_test: pd.DataFrame, run_dir: Path, cfg: Config, devi
 
 
 def main():
+    """Entry point for training, evaluation, and artifact export.
+
+    Workflow:
+        1. Create config and set seeds
+        2. Create run directory and write config
+        3. Load manifest and create splits (if needed)
+        4. Build transforms, datasets, loaders
+        5. Build model, losses, optimizer
+        6. Train for cfg.epochs and save checkpoints/plots
+        7. Evaluate on test split and save metrics
+        8. Save qualitative examples and NIfTI predictions
+    """
     cfg = Config()
     set_seed(cfg.seed)
 
@@ -536,11 +842,13 @@ def main():
     train_df, val_df, test_df = make_splits(cfg, df)
 
     print(f"Train={len(train_df)}  Val={len(val_df)}  Test={len(test_df)}")
-    pd.concat([
-        train_df.assign(split="train"),
-        val_df.assign(split="val"),
-        test_df.assign(split="test"),
-    ]).to_csv(run_dir / "manifest_used.csv", index=False)
+    pd.concat(
+        [
+            train_df.assign(split="train"),
+            val_df.assign(split="val"),
+            test_df.assign(split="test"),
+        ]
+    ).to_csv(run_dir / "manifest_used.csv", index=False)
 
     train_items = make_items(train_df)
     val_items = make_items(val_df)
@@ -548,7 +856,8 @@ def main():
 
     train_tf, val_tf = build_transforms(cfg)
 
-    # train лучше НЕ кэшировать полностью из-за рандом-кропа, но cache_rate=0.2 допустимо (как у тебя)
+    # Caching the training set fully is not ideal due to random crops.
+    # cache_rate=0.2 is a reasonable compromise.
     train_ds = CacheDataset(train_items, transform=train_tf, cache_rate=cfg.cache_rate, num_workers=0)
     val_ds = CacheDataset(val_items, transform=val_tf, cache_rate=cfg.cache_rate, num_workers=0)
     test_ds = CacheDataset(test_items, transform=val_tf, cache_rate=cfg.cache_rate, num_workers=0)
@@ -583,9 +892,7 @@ def main():
     model = build_model(cfg, device)
 
     dice_loss = DiceLoss(to_onehot_y=True, softmax=True)
-    ce_loss = nn.CrossEntropyLoss(
-        weight=torch.tensor([1.0, cfg.pos_class_weight], device=device)
-    )
+    ce_loss = nn.CrossEntropyLoss(weight=torch.tensor([1.0, cfg.pos_class_weight], device=device))
 
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     scaler = GradScaler("cuda", enabled=(cfg.amp and torch.cuda.is_available()))
@@ -602,13 +909,21 @@ def main():
         t0 = time.time()
 
         tr_loss, tr_dice, tr_f1 = train_one_epoch(
-            model, train_loader, optimizer, dice_loss, ce_loss, cfg, device, scaler,
-            post_pred, post_label, dice_metric
+            model,
+            train_loader,
+            optimizer,
+            dice_loss,
+            ce_loss,
+            cfg,
+            device,
+            scaler,
+            post_pred,
+            post_label,
+            dice_metric,
         )
 
         val_loss, val_dice, val_f1 = evaluate(
-            model, val_loader, dice_loss, ce_loss, cfg, device,
-            post_pred, post_label, dice_metric
+            model, val_loader, dice_loss, ce_loss, cfg, device, post_pred, post_label, dice_metric
         )
 
         dt = time.time() - t0
@@ -653,8 +968,7 @@ def main():
 
     print("\n=== TEST ===")
     test_loss, test_dice, test_f1 = evaluate(
-        model, test_loader, dice_loss, ce_loss, cfg, device,
-        post_pred, post_label, dice_metric
+        model, test_loader, dice_loss, ce_loss, cfg, device, post_pred, post_label, dice_metric
     )
     print(f"TEST loss={test_loss:.4f} dice={test_dice:.4f} f1={test_f1:.4f}")
     pd.DataFrame([{"test_loss": test_loss, "test_dice": test_dice, "test_f1": test_f1}]).to_csv(
